@@ -48,37 +48,17 @@ Notes:
 import os
 import re
 import json
+import torch
 import argparse
 from pathlib import Path
 
-os.environ["TORCH_DEVICE"] = "cpu"
+os.environ["TORCH_DEVICE"] = "cuda"
 
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def is_heading(line: str) -> bool:
-    """Detect markdown headings or numbered section headings."""
-    if re.match(r"^#{1,6}\s+\S", line):
-        return True
-    if re.match(r"^\d+(\.\d+)*\s+[A-Z]", line):
-        return True
-    return False
-
-
-def clean_heading(line: str) -> str:
-    return re.sub(r"^#{1,6}\s+", "", line).strip()
-
-
-def is_noise(text: str) -> bool:
-    if re.fullmatch(r"[\d\s]+", text):
-        return True
-    if len(text) < 15 and " " not in text:
-        return True
-    return False
-
 
 def save_images(images: dict, images_dir: Path) -> dict:
     """Save PIL images to disk, return {image_id: file_path}."""
@@ -95,22 +75,6 @@ def save_images(images: dict, images_dir: Path) -> dict:
 # ── Parser ────────────────────────────────────────────────────────────────────
 
 def parse_markdown(markdown: str, allowed_types: set, saved_images: dict) -> list:
-    """
-    Parse marker-pdf markdown into clean sections.
-
-    Each section is a dict with:
-        title     : str
-        text      : str (all paragraphs merged)
-        equations : list[str]
-        tables    : list[{caption, content}]
-        figures   : list[{caption, image_id, image_path}]
-
-    Images are linked by matching ![](_page_X_Figure_Y.jpeg) references
-    to their saved file paths and the following caption line.
-    Table captions are linked to the table rows that follow them.
-    Single-line and multi-line $$ equations are both handled correctly.
-    """
-
     lines = markdown.split("\n")
     sections = []
 
@@ -120,21 +84,59 @@ def parse_markdown(markdown: str, allowed_types: set, saved_images: dict) -> lis
         "equations": [],
         "tables": [],
         "figures": [],
-        "pending_image_id": None,
         "pending_table_caption": None,
+        "last_text_line": None,  # ← IMPORTANT (for captions above images)
     }
 
-    def flush_section():
-        if current["pending_image_id"]:
-            if "figure" in allowed_types:
-                current["figures"].append({
-                    "caption": "",
-                    "image_id": current["pending_image_id"],
-                    "image_path": saved_images.get(current["pending_image_id"], ""),
-                })
-        current["pending_image_id"] = None
-        current["pending_table_caption"] = None
+    # ── Skip patterns ────────────────────────────────────────────────────────
+    SKIP_LINE_PATTERNS = [
+        re.compile(r'STANDARDNI OPERATIVNI POSTOPEK', re.IGNORECASE),
+        re.compile(r'^Velja od:', re.IGNORECASE),
+        re.compile(r'^Velja do:', re.IGNORECASE),
+        re.compile(r'ZAUPNO', re.IGNORECASE),
+        re.compile(r'^Oznaka:', re.IGNORECASE),
+        re.compile(r'NEKONTROLIRANA KOPIJA', re.IGNORECASE),
+        re.compile(r'NAVODILO ZA INTEGRACIJO KROMATOGRAFSKIH VRHOV', re.IGNORECASE),
+    ]
 
+    SKIP_HEADING_PATTERNS = [
+        re.compile(r'KAZALO', re.IGNORECASE),
+    ]
+
+    SKIP_TABLE_PATTERNS = [
+        re.compile(r'Pripravila', re.IGNORECASE),
+        re.compile(r'Pregledala', re.IGNORECASE),
+        re.compile(r'STANDARDNI OPERATIVNI POSTOPEK', re.IGNORECASE),
+    ]
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def is_heading(line):
+        return bool(re.match(r'^#{1,6}\s+\S', line))
+
+    def clean_heading(line):
+        return re.sub(r'^#{1,6}\s+', '', line).strip()
+
+    def is_skip_line(line):
+        return any(p.search(line) for p in SKIP_LINE_PATTERNS)
+
+    def is_noise(text):
+        text = text.strip()
+        if len(text) == 1 and text.isalpha():
+            return False
+        return bool(re.fullmatch(r'[\d\s\-–—|._/\\]+', text)) or len(text) < 3
+
+    def clean_text(line):
+        line = re.sub(r'\*{1,2}(.+?)\*{1,2}', r'\1', line)
+        line = re.sub(r'<[^>]+>', '', line)
+        line = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', line)
+        return line.strip()
+
+    def is_skip_table(table_lines):
+        data_rows = [l for l in table_lines if l.startswith('|') and '---' not in l][:2]
+        all_cells = ' '.join(data_rows)
+        return any(p.search(all_cells) for p in SKIP_TABLE_PATTERNS)
+
+    def flush_section():
         merged_text = " ".join(current["text_lines"]).strip()
         merged_text = re.sub(r"\s+", " ", merged_text)
 
@@ -151,62 +153,77 @@ def parse_markdown(markdown: str, allowed_types: set, saved_images: dict) -> lis
         current["equations"].clear()
         current["tables"].clear()
         current["figures"].clear()
+        current["pending_table_caption"] = None
+        current["last_text_line"] = None
 
+    # ── Main loop ────────────────────────────────────────────────────────────
     i = 0
     while i < len(lines):
         line = lines[i].rstrip()
 
-        # ── Section heading ──────────────────────────────────────────────────
-        if is_heading(line):
-            flush_section()
-            current["title"] = clean_heading(line)
-            current["pending_image_id"] = None
-            current["pending_table_caption"] = None
-            i += 1
-            continue
-
-        # ── Skip blank lines (preserve pending ids across them) ──────────────
         if not line.strip():
             i += 1
             continue
 
-        # Strip inline HTML tags for pattern matching
-        clean_line = re.sub(r"<[^>]+>", "", line).strip()
+        if is_skip_line(line):
+            i += 1
+            continue
 
-        # ── Image reference: ![](_page_X_Figure_Y.jpeg) ──────────────────────
-        img_match = re.match(r"!\[.*?\]\((.+?)\)", line)
+        stripped = re.sub(r'^#{1,6}\s+', '', line).strip()
+        if any(p.search(stripped) for p in SKIP_HEADING_PATTERNS):
+            i += 1
+            continue
+
+        # ── Heading ─────────────────────────────────────────────────────────
+        if is_heading(line):
+            flush_section()
+            current["title"] = clean_heading(line)
+            i += 1
+            continue
+
+        # ── Image (caption ABOVE) ───────────────────────────────────────────
+        img_match = re.match(r'!\[.*?\]\((.+?)\)', line)
         if img_match:
-            current["pending_image_id"] = img_match.group(1)
-            i += 1
-            continue
+            img_id = img_match.group(1)
 
-        # ── Figure caption: Figure N: ... ────────────────────────────────────
-        if re.match(r"^(Figure|Fig\.)\s*\d+", clean_line, re.IGNORECASE):
-            if "figure" in allowed_types:
+            caption = current.get("last_text_line")
+
+            # ── RULES ─────────────────────────────────────────────
+            is_picture = "Picture_" in img_id
+            has_caption = caption and not is_noise(caption)
+
+            # keep image only if:
+            # - NOT a Picture OR
+            # - it has a meaningful caption
+            keep_image = (not is_picture) or has_caption
+
+            if keep_image and "figure" in allowed_types:
                 current["figures"].append({
-                    "caption": clean_line,
-                    "image_id": current["pending_image_id"] or "",
-                    "image_path": saved_images.get(current["pending_image_id"], "") if current["pending_image_id"] else "",
+                    "caption": caption if has_caption else "",
+                    "image_id": img_id,
+                    "image_path": saved_images.get(img_id, ""),
                 })
-            current["pending_image_id"] = None
+
+            # reset caption buffer
+            current["last_text_line"] = None
+
             i += 1
             continue
-
-        # ── Table caption: Table N: ... ──────────────────────────────────────
+        # ── Table caption ───────────────────────────────────────────────────
+        clean_line = clean_text(line)
         if re.match(r"^Table\s*\d+", clean_line, re.IGNORECASE):
             current["pending_table_caption"] = clean_line
             i += 1
             continue
 
-        # ── Equation block: $$ ... $$ ─────────────────────────────────────────
+        # ── Equation ────────────────────────────────────────────────────────
         if line.strip().startswith("$$"):
-            # Single-line equation: $$...$$ opens and closes on the same line
             if line.strip().endswith("$$") and len(line.strip()) > 4:
                 if "equation" in allowed_types:
                     current["equations"].append(line.strip())
                 i += 1
                 continue
-            # Multi-line equation: $$ alone on a line, collect until closing $$
+
             eq_lines = [line]
             i += 1
             while i < len(lines) and not lines[i].strip().startswith("$$"):
@@ -215,38 +232,76 @@ def parse_markdown(markdown: str, allowed_types: set, saved_images: dict) -> lis
             if i < len(lines):
                 eq_lines.append(lines[i])
                 i += 1
+
             if "equation" in allowed_types:
                 current["equations"].append("\n".join(eq_lines).strip())
             continue
 
-        # ── Table block: | ... | lines ────────────────────────────────────────
+        # ── Table ───────────────────────────────────────────────────────────
         if line.startswith("|"):
             table_lines = [line]
             i += 1
             while i < len(lines) and lines[i].startswith("|"):
                 table_lines.append(lines[i])
                 i += 1
-            if "table" in allowed_types:
+
+            if not is_skip_table(table_lines) and "table" in allowed_types:
                 current["tables"].append({
                     "caption": current["pending_table_caption"] or "",
                     "content": "\n".join(table_lines),
                 })
+
             current["pending_table_caption"] = None
             continue
 
-        # ── Regular text ──────────────────────────────────────────────────────
+        # ── Text ────────────────────────────────────────────────────────────
         if "text" in allowed_types:
-            clean = re.sub(r"\*{1,2}(.+?)\*{1,2}", r"\1", line).strip()
-            clean = re.sub(r"<[^>]+>", "", clean).strip()
-            clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", clean)
+            clean = clean_text(line)
             if clean and not is_noise(clean):
                 current["text_lines"].append(clean)
+                current["last_text_line"] = clean  # ← store for figure caption
 
         i += 1
 
     flush_section()
     return sections
 
+def build_toc_tree(sections):
+    toc = []
+
+    for s in sections:
+        title = s["title"]
+        match = re.match(r'^(\d+(\.\d+)*)\s+(.*)', title)
+
+        if match:
+            level = match.group(1).count('.') + 1
+            toc.append({
+                "level": level,
+                "number": match.group(1),
+                "title": match.group(3),
+            })
+        else:
+            toc.append({
+                "level": 1,
+                "number": None,
+                "title": title,
+            })
+
+    return toc
+
+def build_toc_from_sections(sections):
+    toc = []
+    for s in sections:
+        # Match leading number, optional dot or dash, then whitespace
+        match = re.match(r'^(\d+(\.\d+)*)(?:[.\-])?\s*(.*)', s['title'])
+        if match:
+            number = match.group(1)
+            title  = match.group(3).strip()
+        else:
+            number = None
+            title  = s['title'].strip()
+        toc.append({"number": number, "title": title})
+    return toc
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
@@ -289,10 +344,7 @@ def process(pdf_path: str, output_path: str, allowed_types: set) -> None:
         "source": Path(pdf_path).name,
         "metadata": {
             "pages": len(metadata.get("page_stats", [])),
-            "toc": [
-                {"title": e["title"], "page": e["page_id"]}
-                for e in metadata.get("table_of_contents", [])
-            ],
+            "toc": build_toc_from_sections(sections),
         },
         "sections": sections,
     }
